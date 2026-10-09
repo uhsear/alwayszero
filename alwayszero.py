@@ -702,6 +702,21 @@ def self_test():
     check(_parse(["a.py", "b.py"]).paths == ["a.py", "b.py"],
           "several paths are read")
 
+    def refused(argv):
+        """True when the parser exits on argv instead of accepting it."""
+        saved = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            _parse(argv)
+        except SystemExit:
+            return True
+        finally:
+            sys.stderr = saved
+        return False
+
+    check(refused(["a.py", "--self"]),
+          "a unique prefix of --self-test is refused  <-- pinned defect")
+
     # ---- end to end, on a temporary tree
     root = tempfile.mkdtemp(prefix="alwayszero-")
     try:
@@ -785,6 +800,7 @@ def _parse(argv):
         description="Name every scheduled script that cannot report failure.",
         epilog="Exit 1 means work was found, so this drives a detect-and-"
                "remediate loop. A tree that could not be read is never clean.",
+        allow_abbrev=False,
     )
     ap.add_argument("paths", nargs="*",
                     help="files or directories to scan")

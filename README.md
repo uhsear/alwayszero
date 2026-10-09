@@ -87,6 +87,7 @@ PASS  a trailing comma in an import line is not a module name
 PASS  a silent script that notifies is ranked above one that does not
 PASS  the report line starts with the verdict
 ...
+PASS  a unique prefix of --self-test is refused  <-- pinned defect
 PASS  a tree with a silent script exits 1
 PASS  the silent script is named
 ...
@@ -107,11 +108,11 @@ PASS  a byte no codec claims does not stop the scan either
 PASS  no path at all is a usage error
 PASS  the usage error names --self-test
 --------------------------------------------------------------------
-104 assertions, 0 failed
+105 assertions, 0 failed
 ```
 
-That run is 104 assertions on Windows under `C:\Python313\python.exe` and 104 on Ubuntu under
-`python3` 3.12.3. The lines cut with `...` are more of the same block above them.
+That run is 105 assertions on Windows under `C:\Python313\python.exe`. The Ubuntu run under
+`python3` 3.12.3 gave 104 before the prefix assertion was added, and it has not been re-run since. The lines cut with `...` are more of the same block above them.
 
 ## Requirements
 
