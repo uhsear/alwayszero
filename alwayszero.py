@@ -716,6 +716,8 @@ def self_test():
 
     check(refused(["a.py", "--self"]),
           "a unique prefix of --self-test is refused  <-- pinned defect")
+    check(refused(["a.py", "--self-te"]),
+          "a longer unique prefix of --self-test is refused  <-- pinned defect")
 
     # ---- end to end, on a temporary tree
     root = tempfile.mkdtemp(prefix="alwayszero-")

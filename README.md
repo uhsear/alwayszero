@@ -108,10 +108,10 @@ PASS  a byte no codec claims does not stop the scan either
 PASS  no path at all is a usage error
 PASS  the usage error names --self-test
 --------------------------------------------------------------------
-105 assertions, 0 failed
+106 assertions, 0 failed
 ```
 
-That run is 105 assertions on Windows under `C:\Python313\python.exe`. The Ubuntu run under
+That run is 106 assertions on Windows under `C:\Python313\python.exe`. The Ubuntu run under
 `python3` 3.12.3 gave 104 before the prefix assertion was added, and it has not been re-run since. The lines cut with `...` are more of the same block above them.
 
 ## Requirements
