@@ -23,7 +23,7 @@ cannot say the word failed, which is the worst shape here and is ranked first.
 ruff and pylint own the single handler and own it well. E722 flags a bare
 except, BLE001 a blind except Exception, S110 a try/except/pass, and W0702 and
 W0703 do the same for pylint. Run them. Two things are left over. They are
-Python 3 parsers, and on the 743-file county tree this was built from, 340 files
+Python 3 parsers, and on the 743-file tree this was built from, 340 files
 do not parse as Python 3 at all, so ruff reports a million syntax diagnostics
 there and no handler at all, while tokenize reads 738 of the 743. And none of
 them forms a whole-file verdict: a handler is flagged, but no tool says this
@@ -38,8 +38,15 @@ skip ruff on code that parses.
     python alwayszero.py D:/GIS/Scripts --sites
     python alwayszero.py D:/GIS/Scripts --json
 
-Exit codes: 0 no silent script, 1 at least one silent script, 2 nothing silent
-but a file could not be read, 64 usage error.
+The second shape is the environment gate. A dev switch read from the environment
+-- `if os.environ.get("RUN_MODE"): sys.exit(0)` -- is inherited by every child
+process, so one variable set once on a workstation, in a profile or in a service
+account turns the next nightly run into a job that exits 0 having done nothing.
+The verdict for such a file is ENVNOOP. A switch belongs on the command line,
+where a scheduler has to type it on purpose.
+
+Exit codes: 0 no silent script and no environment gate, 1 at least one of
+either, 2 nothing found but a file could not be read, 64 usage error.
 
 EXIT CODE POLARITY. 1 means work was found, so this drives a detect-and-
 remediate loop the same way stalehost does. A tree that could not be read is
@@ -87,8 +94,9 @@ SILENT = "SILENT"        # a catch-all handler, and the exit code is a constant
 REPORTS = "REPORTS"      # a catch-all handler, but the file can exit non-zero
 CLEAN = "CLEAN"          # no catch-all handler
 UNREADABLE = "UNREADABLE"  # tokenize refused the file
+ENVNOOP = "ENVNOOP"      # an environment variable can end the run with exit 0
 
-VERDICT_ORDER = (UNREADABLE, SILENT, REPORTS, CLEAN)
+VERDICT_ORDER = (UNREADABLE, SILENT, ENVNOOP, REPORTS, CLEAN)
 
 # Exit-call status, as reported per file.
 NO_EXIT = "none"
@@ -123,29 +131,58 @@ _ADDERROR_RE = re.compile(r"(?<![\w])(?:AddError|AddIDMessage|AddReturnMessage)\
 _IMPORT_RE = re.compile(r"^[ \t]*import[ \t]+(.+)$")
 _FROM_RE = re.compile(r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import\b")
 
+# A read of the environment: os.environ, os.getenv, or the bare names after
+# `from os import environ`. The lookbehind keeps self.environ off.
+_ENV_RE = re.compile(r"(?<![\w.])(?:os\.)?(?:environ|getenv)\b")
+
+# The literal variable name, read from the unmasked line because the masker
+# blanks every string: environ["K"], environ.get("K"), getenv("K"), and
+# "K" in os.environ. A name held in a variable is not recovered.
+_ENVNAME_RES = (
+    re.compile(r"""(?:environ(?:\.get)?|getenv)\s*[\[(]\s*(['"])([^'"]+)\1"""),
+    re.compile(r"""(['"])([^'"]+)\1\s+(?:not\s+)?in\s+(?:os\.)?environ\b"""),
+)
+
+# An if or elif header, and an assignment. `==` is not an assignment.
+_IF_RE = re.compile(r"^([ \t]*)(?:if|elif)\b(.*)$")
+_ASSIGN_RE = re.compile(r"^[ \t]*([A-Za-z_]\w*)[ \t]*=(?!=)(.*)$")
+
 # Arguments that mean the process ends successfully anyway. "0L" is a Python 2
 # long literal and turns up in this corpus.
 _ZERO_STATUS = ("", "0", "0L", "None")
 
 
-def mask_source(text):
+def _strip_bom(text):
+    """Drop a leading UTF-8 byte order mark, the way Python does on import."""
+    if text.startswith("\ufeff"):
+        return text[1:]
+    return text
+
+
+def mask_source(text, tokenizer=tokenize.generate_tokens):
     """Return the source as lines with every comment and string body blanked.
 
     Blanking preserves line and column positions, so a finding still reports
     the line the reader will open. The point is that the word raise inside a
     docstring, and an except: inside a SQL string, stop being code.
 
-    Raises UnreadableSource when tokenize refuses the file.
+    Raises UnreadableSource when tokenize refuses the file. Python 3.9 and 3.10
+    do not raise on an unterminated one-line string: they yield the opening
+    quote as an ERRORTOKEN and carry on, so that token is refused here too.
+    The tokenizer argument is for the self-test, which feeds it that stream.
     """
-    if text.startswith("\ufeff"):
-        # A Windows editor saves a BOM; Python strips it on import, tokenize
-        # does not, and the first line would otherwise look like garbage.
-        text = text[1:]
+    # A Windows editor saves a BOM; Python strips it on import, tokenize
+    # does not, and the first line would otherwise look like garbage.
+    text = _strip_bom(text)
     grid = [list(line) for line in text.splitlines()]
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        tokens = list(tokenizer(io.StringIO(text).readline))
     except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
         raise UnreadableSource(str(exc))
+    for token in tokens:
+        if token[0] == tokenize.ERRORTOKEN and token[1] in ("'", '"'):
+            raise UnreadableSource("unterminated string literal on line %d"
+                                   % token[2][0])
     for token in tokens:
         if token[0] not in (tokenize.STRING, tokenize.COMMENT):
             continue
@@ -218,6 +255,23 @@ class Site(object):
                 "quiet": self.quiet, "note": self.note}
 
 
+def block_after(masked, index, indent, tail):
+    """The text of the block a header line opens: its tail, then deeper lines.
+
+    A blank line does not end the block. The first non-blank line at or above
+    the header's own indent does.
+    """
+    body = [tail]
+    own = _indent(indent + "x")
+    for following in masked[index + 1:]:
+        if not following.strip():
+            continue
+        if _indent(following) <= own:
+            break
+        body.append(following)
+    return "\n".join(body)
+
+
 def find_handlers(masked):
     """Every catch-all handler in a masked source, quiet ones marked.
 
@@ -233,15 +287,7 @@ def find_handlers(masked):
         indent, clause, tail = match.group(1), match.group(2), match.group(3)
         if not catches_everything(clause):
             continue
-        body = [tail]
-        own = _indent(indent + "x")
-        for following in masked[index + 1:]:
-            if not following.strip():
-                continue
-            if _indent(following) <= own:
-                break
-            body.append(following)
-        text = "\n".join(body)
+        text = block_after(masked, index, indent, tail)
         reraises = bool(_RAISE_RE.search(text))
         exits = exit_status(text) == NONZERO_EXIT
         note = ""
@@ -251,6 +297,83 @@ def find_handlers(masked):
         sites.append(Site(index + 1, " ".join(clause.split()),
                           not (reraises or exits), note))
     return sites
+
+
+class Gate(object):
+    """One if or elif that reads the environment and can end the run with 0."""
+
+    def __init__(self, line, env, via):
+        self.line = line
+        self.env = env        # literal variable names; empty when held in a name
+        self.via = via        # assigned names that carried the environment read
+
+    def as_dict(self):
+        return {"line": self.line, "env": self.env, "via": self.via}
+
+
+def split_header(rest):
+    """Split the text after if or elif into (condition, tail), or None.
+
+    The split is at the first colon outside brackets that is not a walrus.
+    None means the header carries on to the next line, which a line scanner
+    does not follow.
+    """
+    depth = 0
+    for pos, char in enumerate(rest):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == ":" and depth == 0 and rest[pos + 1:pos + 2] != "=":
+            return rest[:pos], rest[pos + 1:]
+    return None
+
+
+def env_names(line):
+    """The literal environment variable names read on one unmasked line."""
+    return [match.group(2) for rx in _ENVNAME_RES for match in rx.finditer(line)]
+
+
+def find_gates(masked, original):
+    """Every if or elif whose condition reads the environment and whose block
+    ends the process with status zero.
+
+    A name assigned from an environment read carries it to a later condition,
+    until the name is assigned something else. A block that can also exit
+    non-zero fails loudly and is not a gate. `original` is the unmasked lines,
+    for the variable names the masker blanked.
+    """
+    carried = {}      # name -> env names from the assignment that set it
+    gates = []
+    for index, line in enumerate(masked):
+        match = _ASSIGN_RE.match(line)
+        if match is not None:
+            name = match.group(1)
+            if _ENV_RE.search(match.group(2)):
+                carried[name] = env_names(original[index])
+            else:
+                carried.pop(name, None)
+            continue
+        match = _IF_RE.match(line)
+        if match is None:
+            continue
+        parts = split_header(match.group(2))
+        if parts is None:
+            continue
+        condition, tail = parts
+        direct = _ENV_RE.search(condition) is not None
+        via = sorted(name for name in carried
+                     if re.search(r"(?<![\w.])%s\b" % re.escape(name), condition))
+        if not direct and not via:
+            continue
+        if exit_status(block_after(masked, index, match.group(1), tail)) \
+                != ZERO_EXIT:
+            continue
+        names = set(env_names(original[index])) if direct else set()
+        for name in via:
+            names.update(carried[name])
+        gates.append(Gate(index + 1, sorted(names), via))
+    return gates
 
 
 def notifiers(masked):
@@ -275,17 +398,23 @@ class Report(object):
     """One file's verdict."""
 
     def __init__(self, name, verdict, sites=(), exits=NO_EXIT, notifies=(),
-                 reason=""):
+                 reason="", gates=()):
         self.name = name
         self.verdict = verdict
         self.sites = list(sites)
         self.exits = exits
         self.notifies = list(notifies)
         self.reason = reason
+        self.gates = list(gates)
 
     @property
     def quiet_sites(self):
         return [site for site in self.sites if site.quiet]
+
+    @property
+    def gate_env(self):
+        """Every literal variable name behind this file's gates, sorted."""
+        return sorted(set(name for gate in self.gates for name in gate.env))
 
     def as_dict(self):
         return {"file": self.name, "verdict": self.verdict,
@@ -293,7 +422,8 @@ class Report(object):
                 "handlers": len(self.sites),
                 "quiet": len(self.quiet_sites),
                 "reason": self.reason,
-                "sites": [site.as_dict() for site in self.sites]}
+                "sites": [site.as_dict() for site in self.sites],
+                "gates": [gate.as_dict() for gate in self.gates]}
 
 
 def scan_source(text, name="<source>"):
@@ -315,6 +445,7 @@ def scan_source(text, name="<source>"):
     sites = find_handlers(masked)
     exits = exit_status("\n".join(masked))
     notifies = notifiers(masked)
+    gates = find_gates(masked, _strip_bom(text).splitlines())
     quiet = [site for site in sites if site.quiet]
     if not quiet:
         verdict = CLEAN
@@ -322,7 +453,11 @@ def scan_source(text, name="<source>"):
         verdict = REPORTS
     else:
         verdict = SILENT
-    return Report(name, verdict, sites, exits, notifies)
+    # A gate is found whatever the handlers say, but it only sets the verdict
+    # when nothing worse already has: SILENT stays SILENT and lists the gate.
+    if gates and verdict in (CLEAN, REPORTS):
+        verdict = ENVNOOP
+    return Report(name, verdict, sites, exits, notifies, gates=gates)
 
 
 def rank(report):
@@ -342,6 +477,9 @@ def report_line(report):
     notes = ""
     if report.notifies:
         notes = "  notifies=%s" % ",".join(report.notifies)
+    if report.gates:
+        notes += "  gates=%d env=%s" % (
+            len(report.gates), ",".join(report.gate_env) or "?")
     return "%-10s %s  handlers=%d quiet=%d exit=%s%s" % (
         report.verdict, report.name, len(report.sites),
         len(report.quiet_sites), report.exits, notes)
@@ -356,6 +494,11 @@ def site_lines(report):
             site.line, clause, "QUIET" if site.quiet else "reports"))
         if site.note:
             out.append("              %s" % site.note)
+    for gate in report.gates:
+        out.append("    line %-5d %-28s %s" % (
+            gate.line, "env gate", "NOOP env=%s%s" % (
+                ",".join(gate.env) or "?",
+                (" via=%s" % ",".join(gate.via)) if gate.via else "")))
     return out
 
 
@@ -366,10 +509,11 @@ def summary(reports):
         counts[report.verdict] = counts.get(report.verdict, 0) + 1
     notifying = len([r for r in reports
                      if r.verdict == SILENT and r.notifies])
-    return ("ALWAYSZERO silent=%d (notifying=%d) reports=%d clean=%d "
-            "unreadable=%d scanned=%d" % (
-                counts.get(SILENT, 0), notifying, counts.get(REPORTS, 0),
-                counts.get(CLEAN, 0), counts.get(UNREADABLE, 0), len(reports)))
+    return ("ALWAYSZERO silent=%d (notifying=%d) envnoop=%d reports=%d "
+            "clean=%d unreadable=%d scanned=%d" % (
+                counts.get(SILENT, 0), notifying, counts.get(ENVNOOP, 0),
+                counts.get(REPORTS, 0), counts.get(CLEAN, 0),
+                counts.get(UNREADABLE, 0), len(reports)))
 
 
 # --------------------------------------------------------------------- i/o
@@ -420,42 +564,65 @@ def scan_path(path):
 
 # --------------------------------------------------------------- self-test
 
+class _Harness(object):
+    """check() and raises() with a count, and the footer the README quotes."""
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+
+    def check(self, cond, label):
+        if cond:
+            self.passed += 1
+            print("PASS  %s" % label)
+        else:
+            self.failed.append(label)
+            print("FAIL  %s" % label)
+
+    def raises(self, fn, label):
+        try:
+            fn()
+        except ValueError:
+            self.check(True, label)
+        except Exception as exc:
+            self.check(False, "%s (wrong exception %r)" % (label, exc))
+        else:
+            self.check(False, "%s (no error raised)" % label)
+
+    def finish(self):
+        print("-" * 68)
+        total = self.passed + len(self.failed)
+        if self.failed:
+            print("%d assertions, %d failed" % (total, len(self.failed)))
+            for label in self.failed:
+                print("  FAILED: %s" % label)
+            return 1
+        print("%d assertions, 0 failed" % total)
+        return 0
+
+
 def self_test():
     """Assertions over the masker, the handler walk and the file verdict."""
     import shutil
     import tempfile
 
-    passed = [0]
-    failed = []
+    harness = _Harness()
+    check, raises = harness.check, harness.raises
 
-    def check(cond, label):
-        if cond:
-            passed[0] += 1
-            print("PASS  %s" % label)
-        else:
-            failed.append(label)
-            print("FAIL  %s" % label)
-
-    def raises(fn, label):
-        try:
-            fn()
-        except ValueError:
-            check(True, label)
-        except Exception as exc:
-            check(False, "%s (wrong exception %r)" % (label, exc))
-        else:
-            check(False, "%s (no error raised)" % label)
-
-    def run(argv):
-        """main() with both streams captured, returning (exit code, output)."""
+    def capture(fn):
+        """Call fn with stdout and stderr captured; return (result, output)."""
         buffer = io.StringIO()
         saved = (sys.stdout, sys.stderr)
         sys.stdout, sys.stderr = buffer, buffer
         try:
-            code = main(argv)
+            result = fn()
         finally:
             sys.stdout, sys.stderr = saved
-        return code, buffer.getvalue()
+        return result, buffer.getvalue()
+
+    def run(argv):
+        """main() with both streams captured, returning (exit code, output)."""
+        return capture(lambda: main(argv))
 
     def verdict(text):
         return scan_source(text).verdict
@@ -603,6 +770,12 @@ def self_test():
     # ---- unreadable is never clean
     raises(lambda: mask_source('x = "unterminated\n'),
            "an unterminated string raises UnreadableSource")
+    # Python 3.9 and 3.10 yield the opening quote as an ERRORTOKEN instead of
+    # raising. Feed that stream in so every host takes the branch.
+    def quote_stream(readline):
+        yield (tokenize.ERRORTOKEN, '"', (1, 4), (1, 5), 'x = "oops\n')
+    raises(lambda: mask_source('x = "oops\n', quote_stream),
+           "an ERRORTOKEN quote, as python 3.9 yields it, is unreadable  <-- pinned defect")
     report = scan_source('x = "unterminated\n', "broken.py")
     check(report.verdict == UNREADABLE,
           "a file tokenize cannot read is UNREADABLE, never CLEAN")
@@ -690,6 +863,137 @@ def self_test():
     check("silent=2 (notifying=1)" in summary([clean, quiet_plain, quiet_mailer]),
           "the summary separates the silent scripts that notify")
 
+    # ---- the environment gate: an inherited variable ends the run with 0
+    gate = scan_source("import os, sys\nif os.environ.get('RUN_MODE'):\n"
+                       "    sys.exit(0)\nwork()\n")
+    check(gate.verdict == ENVNOOP,
+          "an environment read that ends the run with exit 0 is ENVNOOP")
+    check(len(gate.gates) == 1 and gate.gates[0].line == 2,
+          "the gate names the line of the if")
+    check(gate.gate_env == ["RUN_MODE"], "the gate names the variable")
+    check(gate.gates[0].via == [], "a direct read carries no via name")
+    check(scan_source("if os.getenv('DRY'): sys.exit()\nwork()\n").verdict
+          == ENVNOOP, "a one-line gate with os.getenv and bare sys.exit() is read")
+    check(scan_source("if not os.environ.get('ENABLE'):\n    print('off')\n"
+                      "    sys.exit(0)\nwork()\n").verdict == ENVNOOP,
+          "a missing variable that ends the run is a gate too")
+    check(scan_source("if os.environ['K']:\n    exit(0)\n").gate_env == ["K"],
+          "an os.environ subscript names its variable")
+    check(scan_source("if 'K' in os.environ:\n    exit(0)\n").gate_env == ["K"],
+          "a membership test names its variable")
+    check(scan_source("if 'K' not in os.environ:\n    exit(0)\n").gate_env
+          == ["K"], "a negated membership test names its variable")
+    check(scan_source("from os import environ\nif environ.get('K'):\n"
+                      "    exit(0)\n").verdict == ENVNOOP,
+          "a bare environ after from os import environ is read")
+    check(scan_source("if a:\n    pass\nelif os.environ.get('K'):\n"
+                      "    exit(0)\n").gates[0].line == 3,
+          "an elif is a gate too")
+    check(scan_source("if (m := os.environ.get('K')):\n    exit(0)\n").verdict
+          == ENVNOOP, "a parenthesised walrus condition is read")
+    check(scan_source("if m := os.environ.get('K'):\n    exit(0)\n").gate_env
+          == ["K"], "an unparenthesised walrus is not taken for the colon")
+    check(scan_source("if os.environ.get(KEY):\n    exit(0)\n").gate_env == [],
+          "a variable name held in a name is not recovered")
+    check(scan_source("if cache[1:2] or os.getenv('K'):\n    exit(0)\n"
+                      ).gate_env == ["K"],
+          "a colon inside brackets does not end the condition")
+
+    # An assigned name carries the read to a later condition.
+    gate = scan_source("DEV = os.environ.get('MODE_X')\nwork_setup()\n"
+                       "if DEV:\n    sys.exit(0)\n")
+    check(gate.verdict == ENVNOOP and gate.gates[0].via == ["DEV"],
+          "a name assigned from the environment carries the gate to its if")
+    check(gate.gate_env == ["MODE_X"],
+          "the carried variable name comes from the assignment")
+    check(scan_source("A = os.getenv('AAA')\nif A or os.getenv('BBB'):\n"
+                      "    exit(0)\n").gate_env == ["AAA", "BBB"],
+          "a direct read and a carried one are both named, sorted")
+    check(scan_source("DEV = os.environ.get('D')\nDEV = '--dev' in sys.argv\n"
+                      "if DEV:\n    exit(0)\n").verdict == CLEAN,
+          "a name reassigned from the command line is not a gate  <-- pinned defect")
+    check(scan_source("DEV = os.environ.get('D')\nif DEVICE:\n    exit(0)\n"
+                      ).verdict == CLEAN,
+          "a longer name that starts like the carried one is not it  <-- pinned defect")
+    check(scan_source("DEV = os.environ.get('D')\nif cfg.DEV:\n    exit(0)\n"
+                      ).verdict == CLEAN,
+          "an attribute with the carried name is not it  <-- pinned defect")
+    check(scan_source("x = 1\nif x == 1:\n    exit(0)\n").verdict == CLEAN,
+          "an == comparison is not an assignment and not an environment read")
+
+    # The shapes that look like a gate and are not one.
+    check(scan_source("if os.environ.get('K'):\n    sys.exit(1)\n").verdict
+          == CLEAN, "a gate that fails loudly is not a no-op")
+    check(scan_source("if os.environ.get('K'):\n    exit(0)\n    exit(1)\n"
+                      ).verdict == CLEAN,
+          "a gate body that can also exit non-zero is not a no-op")
+    check(scan_source("if os.environ.get('K'):\n    log('dev')\nwork()\n"
+                      ).verdict == CLEAN, "an environment read with no exit is not a gate")
+    check(scan_source("if done:\n    sys.exit(0)\n").verdict == CLEAN,
+          "an exit(0) behind a condition that never reads the environment is fine")
+    check(scan_source("home = os.environ.get('K')\nsys.exit(0)\n").verdict
+          == CLEAN, "an environment read next to an unconditional exit is fine")
+    check(scan_source("# if os.environ.get('K'): exit(0)\n"
+                      "s = 'if os.environ.get(\"K\"): exit(0)'\n").verdict
+          == CLEAN, "a gate inside a comment or a string is not code")
+    check(scan_source("if self.environ.get('K'):\n    exit(0)\n").verdict
+          == CLEAN, "self.environ is not the process environment  <-- pinned defect")
+    check(scan_source("if (os.environ.get('K') and\n        other):\n"
+                      "    exit(0)\n").verdict == CLEAN,
+          "a condition split across lines is not read  <-- known limit")
+    check(scan_source("os.environ.get('K') and sys.exit(0)\n").verdict == CLEAN,
+          "a gate written as one expression is not read  <-- known limit")
+    check(scan_source("if os.environ.get('K'):\n    raise SystemExit\n"
+                      ).verdict == CLEAN,
+          "a bare raise SystemExit is not counted as an exit  <-- known limit")
+    check(scan_source("t = os.environ.get('K')\nf(\n    t=1,\n)\nif t:\n"
+                      "    exit(0)\n").verdict == CLEAN,
+          "a keyword argument line is read as an assignment  <-- known limit")
+
+    # Gate and handlers together.
+    gate = scan_source("import sys\nif os.environ.get('K'):\n    sys.exit(0)\n"
+                       "try:\n    go()\nexcept:\n    log()\n")
+    check(gate.verdict == SILENT and len(gate.gates) == 1,
+          "SILENT stays SILENT and still lists the gate")
+    gate = scan_source("if os.environ.get('K'):\n    exit(0)\ntry:\n    go()\n"
+                       "except:\n    log()\nif bad:\n    raise SystemExit(1)\n")
+    check(gate.verdict == ENVNOOP and len(gate.quiet_sites) == 1,
+          "a gate outranks REPORTS, and the quiet handler is still counted")
+    check(scan_source("if os.environ.get('K'):\n    exit(0)\nif bad:\n"
+                      "    raise SystemExit(1)\n").verdict == ENVNOOP,
+          "a non-zero exit elsewhere does not clear a gate  <-- pinned defect")
+
+    # ---- ranking and rendering of a gate
+    order = [r.name for r in sorted([
+        scan_source("go()\n", "c.py"),
+        scan_source("if os.getenv('K'): exit(0)\n", "g.py"),
+        scan_source("try:\n go()\nexcept:\n log()\n", "s.py"),
+        scan_source("try:\n go()\nexcept:\n log()\nexit(1)\n", "r.py")],
+        key=rank)]
+    check(order == ["s.py", "g.py", "r.py", "c.py"],
+          "ENVNOOP ranks below SILENT and above REPORTS")
+    gate = scan_source("DEV = os.environ.get('MODE_X')\nif DEV:\n    exit(0)\n",
+                       "g.py")
+    check(report_line(gate).startswith(ENVNOOP)
+          and "gates=1 env=MODE_X" in report_line(gate),
+          "the report line names the gate count and the variable")
+    check("env=?" in report_line(scan_source(
+        "if os.environ.get(KEY):\n    exit(0)\n", "g.py")),
+        "a gate whose variable name is not literal prints env=?")
+    check("gates=" not in report_line(scan_source("go()\n", "c.py")),
+          "a file without a gate has no gates column")
+    lines = site_lines(gate)
+    check(len(lines) == 1 and "NOOP env=MODE_X via=DEV" in lines[0],
+          "a site line names the gate, its variable and the carrying name")
+    check("NOOP env=K" in site_lines(scan_source(
+        "if os.getenv('K'): exit(0)\n"))[0] and "via" not in site_lines(
+        scan_source("if os.getenv('K'): exit(0)\n"))[0],
+        "a direct gate has no via column")
+    check("envnoop=1" in summary([gate]), "the summary counts ENVNOOP files")
+    check(gate.as_dict()["gates"] == [
+        {"line": 2, "env": ["MODE_X"], "via": ["DEV"]}],
+        "the JSON record carries the gate detail")
+
     # ---- argument handling
     args = _parse(["a.py"])
     check(args.paths == ["a.py"], "a path is read positionally")
@@ -718,6 +1022,13 @@ def self_test():
           "a unique prefix of --self-test is refused  <-- pinned defect")
     check(refused(["a.py", "--self-te"]),
           "a longer unique prefix of --self-test is refused  <-- pinned defect")
+    # This tool never writes, so there is no --apply. Pin that nobody adds a
+    # write flag without also pinning its prefixes.
+    check(refused(["a.py", "--ap"]) and refused(["a.py", "--apply"]),
+          "there is no write flag, and neither --apply nor a prefix of it parses  <-- pinned defect")
+    check(refused(["a.py", "--js"]) and refused(["a.py", "--si"]),
+          "prefixes of --json and --sites are refused too")
+    check(not refused(["a.py"]), "a plain path is accepted")
 
     # ---- end to end, on a temporary tree
     root = tempfile.mkdtemp(prefix="alwayszero-")
@@ -779,19 +1090,102 @@ def self_test():
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
+    # ---- an environment gate, for real
+    # The claim is that an inherited variable turns a run into an exit-0 no-op.
+    # Run the fixture in a child process, which inherits this process's
+    # environment the way a scheduled task inherits its account's.
+    import subprocess
+    root = tempfile.mkdtemp(prefix="alwayszero-env-")
+    try:
+        fixture = os.path.join(root, "gated.py")
+        marker_file = os.path.join(root, "ran.txt")
+        with open(fixture, "w") as handle:
+            handle.write("import os\nimport sys\n"
+                         "if os.environ.get('ALWAYSZERO_RUN_MODE'):\n"
+                         "    sys.exit(0)\n"
+                         "with open(sys.argv[1], 'w') as out:\n"
+                         "    out.write('ran')\n")
+        clean_env = dict(os.environ)
+        clean_env.pop("ALWAYSZERO_RUN_MODE", None)
+        inherited = dict(clean_env, ALWAYSZERO_RUN_MODE="1")
+        done = subprocess.call([sys.executable, fixture, marker_file],
+                               env=inherited)
+        check(done == 0 and not os.path.exists(marker_file),
+              "with the variable inherited the fixture exits 0 and does nothing")
+        done = subprocess.call([sys.executable, fixture, marker_file],
+                               env=clean_env)
+        check(done == 0 and os.path.exists(marker_file),
+              "without the variable the same fixture does its work")
+        check(subprocess.call([sys.executable, "-c",
+                               "import sys; sys.exit(None)"],
+                              env=clean_env) == 0,
+              "sys.exit(None) ends the process with status 0")
+        code, output = run([fixture, "--sites"])
+        check(code == 1 and output.startswith(ENVNOOP)
+              and "ALWAYSZERO_RUN_MODE" in output,
+              "the scanner reports that same fixture as ENVNOOP, exit 1")
+        check("explicit command line flag" in output,
+              "the remedy line names the command line flag")
+        code, output = run([fixture, "--json"])
+        payload = json.loads(output)
+        check(payload["summary"]["envnoop"] == 1
+              and payload["files"][0]["gates"][0]["env"]
+              == ["ALWAYSZERO_RUN_MODE"],
+              "--json counts the gate and names its variable")
+        with open(fixture, "w") as handle:
+            handle.write("import sys\nDEV = '--dev' in sys.argv\n"
+                         "if DEV:\n    sys.exit(0)\nwork()\n")
+        code, output = run([fixture])
+        check(code == 0 and "CLEAN" in output,
+              "the fix, an explicit command line flag, scans CLEAN, exit 0")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # ---- the harness, and the module run as a script
+    # The harness is the control every other line depends on, so make it fail
+    # on purpose and look at what it says.
+    probe = _Harness()
+    code, output = capture(lambda: (
+        probe.check(False, "bad check"),
+        probe.raises(lambda: None, "no error"),
+        probe.raises(lambda: 1 // 0, "wrong error"),
+        probe.raises(lambda: int("x"), "right error"),
+        probe.finish())[-1])
+    check(code == 1 and probe.passed == 1 and len(probe.failed) == 3,
+          "the harness counts a failed check, a missing error and a wrong one")
+    check("4 assertions, 3 failed" in output and "FAILED: bad check" in output
+          and "no error raised" in output and "wrong exception" in output,
+          "a failing run prints its failures and the footer")
+    import runpy
+    root = tempfile.mkdtemp(prefix="alwayszero-main-")
+    saved_argv = sys.argv
+    try:
+        target = os.path.join(root, "fine.py")
+        with open(target, "w") as handle:
+            handle.write("go()\n")
+        sys.argv = [__file__, target]
+
+        def as_script():
+            try:
+                runpy.run_path(__file__, run_name="__main__")
+            except SystemExit as exc:
+                return exc.code
+
+        code, output = capture(as_script)
+        check(code == 0 and "CLEAN" in output,
+              "run as a script, the module exits with main()'s status")
+        code, output = capture(lambda: runpy.run_path(
+            __file__, run_name="alwayszero_imported"))
+        check(output == "", "imported rather than run, the module does nothing")
+    finally:
+        sys.argv = saved_argv
+        shutil.rmtree(root, ignore_errors=True)
+
     code, output = run([])
     check(code == 64, "no path at all is a usage error")
     check("--self-test" in output, "the usage error names --self-test")
 
-    print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for label in failed:
-            print("  FAILED: %s" % label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    return harness.finish()
 
 
 # --------------------------------------------------------------------- cli
@@ -829,10 +1223,12 @@ def main(argv=None):
     reports = sorted((scan_path(path) for path in iter_sources(args.paths)),
                      key=rank)
     silent = [r for r in reports if r.verdict == SILENT]
+    gated = [r for r in reports if r.verdict == ENVNOOP]
     unreadable = [r for r in reports if r.verdict == UNREADABLE]
 
     if args.json:
-        counts = {"silent": len(silent), "unreadable": len(unreadable),
+        counts = {"silent": len(silent), "envnoop": len(gated),
+                  "unreadable": len(unreadable),
                   "reports": len([r for r in reports if r.verdict == REPORTS]),
                   "clean": len([r for r in reports if r.verdict == CLEAN]),
                   "scanned": len(reports)}
@@ -850,8 +1246,11 @@ def main(argv=None):
             # should have been written against in the first place.
             print("Rewrite the handlers against a run harness that owns the "
                   "exit code: https://github.com/uhsear/jobharness")
+        if gated:
+            print("Move each environment switch to an explicit command line "
+                  "flag, so a scheduler has to type it.")
 
-    if silent:
+    if silent or gated:
         return 1
     if unreadable:
         return 2
