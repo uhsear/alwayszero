@@ -7,7 +7,7 @@ window nobody watches, and falls off the end of the file, so the process exits 0
 whether the FTP connection opened or not:
 
     try:
-        ftp.retrbinary("RETR roll.zip", handle.write)
+        ftp.retrbinary("RETR export.zip", handle.write)
         arcpy.TruncateTable_management(target)
         arcpy.Append_management(staged, target, "NO_TEST")
     except:
@@ -18,20 +18,21 @@ handler body by indentation, and forms one verdict for the whole file: a
 catch-all handler that neither re-raises nor exits, and no non-zero exit
 anywhere else in the file, means the exit code is a constant. When the same file
 also imports smtplib or ftplib it mails or uploads on a schedule and still
-cannot say the word failed, which is the worst shape here and is ranked first.
+cannot say the word failed, which is the worst shape here and is ranked first
+among the SILENT files.
 
 ruff and pylint own the single handler and own it well. E722 flags a bare
 except, BLE001 a blind except Exception, S110 a try/except/pass, and W0702 and
 W0703 do the same for pylint. Run them. Two things are left over. They are
-Python 3 parsers, and on the 743-file tree this was built from, 340 files
-do not parse as Python 3 at all, so ruff reports a million syntax diagnostics
-there and no handler at all, while tokenize reads 738 of the 743. And none of
-them forms a whole-file verdict: a handler is flagged, but no tool says this
-file cannot exit non-zero and it emails somebody about it. pytlint gained a
-script mode and rule PYT023 for it, and it is the better tool on a file that
-parses, but it needs an ast and an `if __name__` guard, which together reach 10
-of those 743 files. This tool is for the other tree. Nothing here is a reason to
-skip ruff on code that parses.
+Python 3 parsers, and many old scheduled scripts are Python 2, which a Python 3
+parser rejects whole: ruff then reports syntax errors and no handler at all,
+while tokenize still reads nearly every such file. And none of them forms a
+whole-file verdict: a handler is flagged, but no tool says this file cannot exit
+non-zero and it emails somebody about it. pytlint gained a script mode and rule
+PYT023 for it, and it is the better tool on a file that parses, but it needs an
+ast and an `if __name__` guard, which few old scripts have. This tool is for the
+other tree. Nothing here is a reason to skip ruff on code that parses. The
+counts from the private tree this was built on are not published.
 
     python alwayszero.py --self-test
     python alwayszero.py nightly_job.py
@@ -42,15 +43,18 @@ The second shape is the environment gate. A dev switch read from the environment
 -- `if os.environ.get("RUN_MODE"): sys.exit(0)` -- is inherited by every child
 process, so one variable set once on a workstation, in a profile or in a service
 account turns the next nightly run into a job that exits 0 having done nothing.
-The verdict for such a file is ENVNOOP. A switch belongs on the command line,
-where a scheduler has to type it on purpose.
+The verdict for such a file is ENVNOOP. It means "an environment-conditional
+exit 0", not "does nothing": the block may do real work first. A switch belongs
+on the command line, where a scheduler has to type it on purpose.
 
 Exit codes: 0 no silent script and no environment gate, 1 at least one of
-either, 2 nothing found but a file could not be read, 64 usage error.
+either, 2 nothing found but a file or directory could not be read, or no .py or
+.pyw file was found to scan, 64 usage error (a bad flag included).
 
 EXIT CODE POLARITY. 1 means work was found, so this drives a detect-and-
 remediate loop the same way stalehost does. A tree that could not be read is
-never reported clean: that is what exit 2 is for.
+never reported clean, and neither is a tree with nothing in it to scan: that is
+what exit 2 is for.
 """
 
 from __future__ import print_function
@@ -103,6 +107,11 @@ NO_EXIT = "none"
 ZERO_EXIT = "zero"
 NONZERO_EXIT = "nonzero"
 
+# Process exit codes. 1 means work was found.
+EXIT_FOUND = 1
+EXIT_UNREAD = 2
+EXIT_USAGE = 64
+
 
 class UnreadableSource(ValueError):
     """tokenize could not read the source. Never treat this as clean."""
@@ -111,15 +120,17 @@ class UnreadableSource(ValueError):
 # --------------------------------------------------------------- the scanner
 
 # One handler clause. The body is everything indented under it, which is why
-# this is a line scanner and not a parser: 340 of the 743 files this was built
-# from have no ast to walk.
+# this is a line scanner and not a parser: many of the old files this was built
+# for do not parse as Python 3, so there is no ast to walk.
 _EXCEPT_RE = re.compile(r"^([ \t]*)except\b([^:]*):(.*)$")
 
-# sys.exit, os._exit, the site builtin exit, and raise SystemExit, with the
-# argument captured so exit(0) can be told from exit(1). The lookbehind keeps
-# the bare-name branch off the tail of sys.exit.
+# The opening of sys.exit(, os._exit(, the site builtins exit( and quit(, and
+# SystemExit(. The argument is read by exit_status, which balances the brackets,
+# so sys.exit(main()) has its argument. The lookbehinds keep the bare-name
+# branch off the tail of sys.exit and off `def exit(self)` and `class SystemExit(`.
 _EXIT_RE = re.compile(
-    r"(?<![\w.])(?:sys\.exit|os\._exit|exit|SystemExit)\s*\(([^()]*)\)")
+    r"(?<![\w.])(?<!def )(?<!class )"
+    r"(?:sys\.exit|os\._exit|exit|quit|SystemExit)\s*\(")
 
 # raise, as a statement and not as part of an identifier such as raised_error.
 _RAISE_RE = re.compile(r"(?<![\w.])raise(?![\w])")
@@ -148,8 +159,9 @@ _IF_RE = re.compile(r"^([ \t]*)(?:if|elif)\b(.*)$")
 _ASSIGN_RE = re.compile(r"^[ \t]*([A-Za-z_]\w*)[ \t]*=(?!=)(.*)$")
 
 # Arguments that mean the process ends successfully anyway. "0L" is a Python 2
-# long literal and turns up in this corpus.
-_ZERO_STATUS = ("", "0", "0L", "None")
+# long literal and turns up in this corpus. Anything else is a failure,
+# including a string: sys.exit("message") prints the message and exits 1.
+_ZERO_STATUS = ("", "0", "0L", "None", "False", "0.0", "0x0", "0o0", "0b0")
 
 
 def _strip_bom(text):
@@ -157,6 +169,18 @@ def _strip_bom(text):
     if text.startswith("\ufeff"):
         return text[1:]
     return text
+
+
+def _lines(text):
+    """Split source into lines the way tokenize counts them.
+
+    str.splitlines also breaks on a form feed, U+2028, U+0085 and a lone CR,
+    which tokenize does not, so every line number after one would shift. A form
+    feed is kept as a space, because Python only uses it to reset a column and
+    the width must not change. A trailing CR of a CRLF pair is dropped.
+    """
+    return [line[:-1] if line.endswith("\r") else line
+            for line in text.replace("\x0c", " ").split("\n")]
 
 
 def mask_source(text, tokenizer=tokenize.generate_tokens):
@@ -174,11 +198,18 @@ def mask_source(text, tokenizer=tokenize.generate_tokens):
     # A Windows editor saves a BOM; Python strips it on import, tokenize
     # does not, and the first line would otherwise look like garbage.
     text = _strip_bom(text)
-    grid = [list(line) for line in text.splitlines()]
+    # Python 3.12 refuses a NUL byte. 3.9 to 3.11 read on through it, so the
+    # verdict would depend on the interpreter. Refuse it everywhere.
+    if "\x00" in text:
+        raise UnreadableSource("source contains NUL bytes")
+    grid = [list(line) for line in _lines(text)]
     try:
         tokens = list(tokenizer(io.StringIO(text).readline))
-    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
-        raise UnreadableSource(str(exc))
+    except Exception as exc:
+        # Deliberately broad. A file tokenize chokes on in any way is a finding
+        # (UNREADABLE), and one pathological file must not abort the scan of
+        # the rest of the tree.
+        raise UnreadableSource(str(exc) or exc.__class__.__name__)
     for token in tokens:
         if token[0] == tokenize.ERRORTOKEN and token[1] in ("'", '"'):
             raise UnreadableSource("unterminated string literal on line %d"
@@ -187,9 +218,8 @@ def mask_source(text, tokenizer=tokenize.generate_tokens):
         if token[0] not in (tokenize.STRING, tokenize.COMMENT):
             continue
         (srow, scol), (erow, ecol) = token[2], token[3]
-        # min() rather than a bounds check: str.splitlines breaks on more
-        # characters than tokenize counts as line ends, so the grid is never
-        # short, and a guard here would be a branch no input can reach.
+        # min() rather than a bounds check: a guard here would be a branch no
+        # input can reach, since _lines counts lines the way tokenize does.
         for row in range(srow, min(erow, len(grid)) + 1):
             line = grid[row - 1]
             start = scol if row == srow else 0
@@ -224,17 +254,35 @@ def catches_everything(clause):
     return any(name.split(".")[-1] in CATCH_ALL_NAMES for name in names if name)
 
 
-def exit_status(text):
+def exit_status(text, original=None):
     """Whether this text ends the process, and with what status.
 
     Returns "nonzero" when any exit call carries a status that is not zero,
     "zero" when every exit call is an exit(0), and "none" when there is none.
     A file whose only exit is sys.exit(0) is the same lie as a file with no
     exit at all, and the report says which one it was.
+
+    text is masked source. original is the same text unmasked, character for
+    character, and is read only to tell sys.exit("message"), which exits 1,
+    from sys.exit(), because the masker blanks the string to spaces.
     """
+    if original is None:
+        original = text
     status = NO_EXIT
     for match in _EXIT_RE.finditer(text):
-        if match.group(1).strip() in _ZERO_STATUS:
+        start = end = match.end()
+        depth = 1
+        # Balance the brackets, so sys.exit(main()) has its whole argument.
+        # A call left open at the end of the text takes the rest of it.
+        while end < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[end], 0)
+            end += 1
+        stop = end - 1 if depth == 0 else end
+        argument = text[start:stop].strip()
+        quoted = '"' in original[start:stop] or "'" in original[start:stop]
+        if not argument and quoted:
+            return NONZERO_EXIT      # a blanked string literal
+        if argument in _ZERO_STATUS:
             status = ZERO_EXIT if status == NO_EXIT else status
         else:
             return NONZERO_EXIT
@@ -255,24 +303,27 @@ class Site(object):
                 "quiet": self.quiet, "note": self.note}
 
 
-def block_after(masked, index, indent, tail):
-    """The text of the block a header line opens: its tail, then deeper lines.
+def block_after(masked, original, index, indent, tail):
+    """The block a header line opens, as (masked text, original text).
 
-    A blank line does not end the block. The first non-blank line at or above
-    the header's own indent does.
+    The text is the header's tail, then the deeper lines. A blank line does not
+    end the block. The first non-blank line at or above the header's own indent
+    does. The two texts line up character for character, because the masker
+    keeps every position.
     """
-    body = [tail]
     own = _indent(indent + "x")
+    end = index + 1
     for following in masked[index + 1:]:
-        if not following.strip():
-            continue
-        if _indent(following) <= own:
+        if following.strip() and _indent(following) <= own:
             break
-        body.append(following)
-    return "\n".join(body)
+        end += 1
+    # tail is a suffix of the masked header line, so it has an original twin.
+    twin = original[index][len(masked[index]) - len(tail):]
+    return ("\n".join([tail] + masked[index + 1:end]),
+            "\n".join([twin] + original[index + 1:end]))
 
 
-def find_handlers(masked):
+def find_handlers(masked, original):
     """Every catch-all handler in a masked source, quiet ones marked.
 
     A handler is quiet when its body neither re-raises nor exits non-zero.
@@ -287,9 +338,9 @@ def find_handlers(masked):
         indent, clause, tail = match.group(1), match.group(2), match.group(3)
         if not catches_everything(clause):
             continue
-        text = block_after(masked, index, indent, tail)
+        text, source = block_after(masked, original, index, indent, tail)
         reraises = bool(_RAISE_RE.search(text))
-        exits = exit_status(text) == NONZERO_EXIT
+        exits = exit_status(text, source) == NONZERO_EXIT
         note = ""
         if not reraises and not exits and _ADDERROR_RE.search(text):
             note = ("AddError is a print in a standalone .py, not a failure; "
@@ -366,8 +417,8 @@ def find_gates(masked, original):
                      if re.search(r"(?<![\w.])%s\b" % re.escape(name), condition))
         if not direct and not via:
             continue
-        if exit_status(block_after(masked, index, match.group(1), tail)) \
-                != ZERO_EXIT:
+        if exit_status(*block_after(masked, original, index, match.group(1),
+                                    tail)) != ZERO_EXIT:
             continue
         names = set(env_names(original[index])) if direct else set()
         for name in via:
@@ -442,10 +493,11 @@ def scan_source(text, name="<source>"):
     # given exit sits inside, so a sys.exit(1) the surrounding bare except
     # would swallow still clears the file. Upgrade path: when the source
     # parses, hand it to pytlint PYT023, which walks an ast and knows.
-    sites = find_handlers(masked)
-    exits = exit_status("\n".join(masked))
+    original = _lines(_strip_bom(text))
+    sites = find_handlers(masked, original)
+    exits = exit_status("\n".join(masked), "\n".join(original))
     notifies = notifiers(masked)
-    gates = find_gates(masked, _strip_bom(text).splitlines())
+    gates = find_gates(masked, original)
     quiet = [site for site in sites if site.quiet]
     if not quiet:
         verdict = CLEAN
@@ -518,19 +570,29 @@ def summary(reports):
 
 # --------------------------------------------------------------------- i/o
 
-def iter_sources(paths):
-    """Every source file under the given files and directories, sorted."""
+def iter_sources(paths, walk=os.walk):
+    """Every source file under the given files and directories, sorted.
+
+    Returns (files, failures). A directory that cannot be listed is a failure,
+    an UNREADABLE report, and never a silent skip: os.walk ignores listing
+    errors unless it is given onerror. The walk argument is for the self-test.
+    """
     found = []
+    failures = []
+
+    def on_error(exc):
+        failures.append(Report(str(exc.filename), UNREADABLE, reason=str(exc)))
+
     for path in paths:
         if os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in walk(path, onerror=on_error):
                 dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRECTORIES)
                 for name in sorted(files):
                     if name.lower().endswith(SOURCE_EXTENSIONS):
                         found.append(os.path.join(root, name))
         else:
             found.append(path)
-    return found
+    return found, failures
 
 
 def read_source(path):
@@ -705,6 +767,47 @@ def self_test():
     check(scan_source("try:\n    go()\nexcept:\n    log()\n"
                       "if bad:\n    raise SystemExit(1)\n").verdict == REPORTS,
           "a raise SystemExit elsewhere in the file clears the verdict")
+    check(exit_status("sys.exit (1)") == NONZERO_EXIT,
+          "white space before the opening bracket of an exit call is read")
+    check(exit_status("def exit(self):\n    return 1\n") == NO_EXIT
+          and exit_status("class SystemExit(Exception):\n    pass\n") == NO_EXIT,
+          "defining a function or class named exit is not a process exit  <-- pinned defect")
+    check(exit_status("quit(0)") == ZERO_EXIT
+          and exit_status("quit(2)") == NONZERO_EXIT,
+          "the site builtin quit ends the process like exit")
+    check(exit_status("sys.exit(False)") == ZERO_EXIT
+          and exit_status("sys.exit(0x0)") == ZERO_EXIT
+          and exit_status("sys.exit(0.0)") == ZERO_EXIT,
+          "False, 0x0 and 0.0 are zero statuses  <-- pinned defect")
+    check(exit_status("sys.exit(0") == ZERO_EXIT,
+          "a call left open at the end of the text still yields its argument")
+
+    # ---- the argument of an exit is read whole, and a string is a failure
+    # sys.exit(main()) is the usual entry point. A pattern that forbade a
+    # bracket inside the argument saw no exit at all, so a script that could
+    # fail was called silent.
+    check(exit_status("sys.exit(main())") == NONZERO_EXIT
+          and exit_status("sys.exit(len(errors))") == NONZERO_EXIT
+          and exit_status("sys.exit(code_for(exc, (1, 2)))") == NONZERO_EXIT,
+          "an exit whose argument is a call is an exit, and not a zero one  <-- pinned defect")
+    check(verdict("import sys\ndef main():\n    try:\n        go()\n"
+                  "    except Exception:\n        return 1\n    return 0\n"
+                  "sys.exit(main())\n") == REPORTS,
+          "a script that ends with sys.exit(main()) is not silent  <-- pinned defect")
+    # The masker blanks a string to spaces, so sys.exit("message") used to read
+    # as sys.exit(), which exits 0. Python prints the message and exits 1.
+    check(verdict("import sys\ntry:\n    go()\nexcept Exception:\n"
+                  "    print('failed')\n    sys.exit('load failed')\n") == CLEAN,
+          "a handler that ends with sys.exit('message') exits 1 and is not silent  <-- pinned defect")
+    check(verdict("import sys\ntry:\n    go()\nexcept Exception:\n"
+                  "    print('failed')\n    sys.exit('')\n") == CLEAN,
+          "sys.exit('') with an empty string also exits 1")
+    check(verdict("if os.environ.get('K'):\n    sys.exit('K is set, refusing')\n"
+                  ) == CLEAN,
+          "a gate that ends with sys.exit('message') exits 1 and is no no-op  <-- pinned defect")
+    check(verdict("if os.environ.get('K'):\n    sys.exit(\n        # why\n    )\n"
+                  ) == ENVNOOP,
+          "a comment inside the exit brackets is not a string")
 
     # ---- AddError, the shape that looks like reporting
     report = scan_source("import arcpy\ntry:\n    go()\nexcept:\n"
@@ -720,6 +823,9 @@ def self_test():
     check(scan_source("import arcpy\ntry:\n    go()\nexcept:\n"
                       "    arcpy.AddIDMessage('ERROR', 12)\n").sites[0].note != "",
           "AddIDMessage carries the same note as AddError")
+    check(scan_source("import arcpy\ntry:\n    go()\nexcept:\n"
+                      "    arcpy.AddReturnMessage(1)\n").sites[0].note != "",
+          "AddReturnMessage carries the same note as AddError")
 
     # ---- the log is not the exit code
     # ruff BLE001 exempts a handler that logs the exception, which is the right
@@ -754,7 +860,7 @@ def self_test():
                       ).notifies == ["smtplib"],
           "the import on the line the mark sits on is still an import  <-- pinned defect")
 
-    # ---- python 2, which is 340 of the 743 files this was built for
+    # ---- python 2, which a python 3 parser rejects whole
     source = "try:\n    print 'working'\nexcept:\n    print 'failed'\n"
     check(verdict(source) == SILENT,
           "a python 2 print statement is scanned, not skipped")
@@ -767,7 +873,51 @@ def self_test():
     check(parsed is False,
           "that same fixture does not parse as python 3  <-- pinned defect")
 
+    # ---- lines are counted the way tokenize counts them
+    # str.splitlines also breaks on these, so every line number after one of
+    # them was one too high, and where the blanking landed moved with it.
+    for label, char in (("a form feed", "\x0c"), ("U+2028", " "),
+                        ("U+0085", "\x85"), ("a lone CR", "\r")):
+        check(scan_source("# a%sb\ntry:\n    go()\nexcept:\n    pass\n"
+                          % char).sites[0].line == 4,
+              "%s inside a comment does not shift the line numbers  <-- pinned defect"
+              % label)
+        check(scan_source("s = 'a%sb'\ntry:\n    go()\nexcept:\n    pass\n"
+                          % char).sites[0].line == 4,
+              "%s inside a string does not shift the line numbers  <-- pinned defect"
+              % label)
+    source = ("try:\n    go()\nexcept:\n    s = '''\n    raise\n    '''\n")
+    check(verdict(source) == SILENT
+          and verdict(source.replace("\n", "\n\x0c")) == SILENT,
+          "a form feed after every line does not change the verdict  <-- pinned defect")
+    report = scan_source("try:\r\n    go()\r\nexcept:\r\n    print('x')\r\n")
+    check(report.verdict == SILENT and report.sites[0].line == 3,
+          "a CRLF file is read, and its handler is on the line the reader opens")
+    check(_indent("\tx") == 8 and _indent("  \tx") == 8
+          and _indent("\t  x") == 10,
+          "a tab advances the indent to the next multiple of eight")
+
     # ---- unreadable is never clean
+    check(verdict("x = 1\x00\ntry:\n    go()\nexcept:\n    pass\n") == UNREADABLE,
+          "a NUL byte is UNREADABLE on every python, not judged from garbage  <-- pinned defect")
+
+    def broken_tokenizer(readline):
+        raise SystemError("tokenizer exploded")
+
+    def mute_tokenizer(readline):
+        raise ValueError()
+
+    def reason(tokenizer):
+        try:
+            mask_source("x = 1\n", tokenizer)
+        except UnreadableSource as exc:
+            return str(exc)
+        return None
+
+    check(reason(broken_tokenizer) == "tokenizer exploded",
+          "any error out of tokenize makes the file UNREADABLE, not a crash  <-- pinned defect")
+    check(reason(mute_tokenizer) == "ValueError",
+          "an error with no message is named by its class")
     raises(lambda: mask_source('x = "unterminated\n'),
            "an unterminated string raises UnreadableSource")
     # Python 3.9 and 3.10 yield the opening quote as an ERRORTOKEN instead of
@@ -862,6 +1012,27 @@ def self_test():
           "the summary counts every file scanned")
     check("silent=2 (notifying=1)" in summary([clean, quiet_plain, quiet_mailer]),
           "the summary separates the silent scripts that notify")
+    check(summary([clean]) == "ALWAYSZERO silent=0 (notifying=0) envnoop=0 "
+          "reports=0 clean=1 unreadable=0 scanned=1"
+          and summary([]) == "ALWAYSZERO silent=0 (notifying=0) envnoop=0 "
+          "reports=0 clean=0 unreadable=0 scanned=0",
+          "an absent verdict counts as zero in the summary")
+    broken = scan_source('x = "oops\n', "zz_broken.py")
+    checked = scan_source("try:\n go()\nexcept:\n log()\nexit(1)\n", "r.py")
+    check(summary([clean, quiet_plain, checked, broken])
+          == "ALWAYSZERO silent=1 (notifying=0) envnoop=0 reports=1 clean=1 "
+          "unreadable=1 scanned=4",
+          "the summary counts every verdict once")
+    # Two silent files, the same notification state. Name order alone would put
+    # a.py first, so only the quiet-handler count can put b.py ahead.
+    one = scan_source("try:\n go()\nexcept:\n log()\n", "a.py")
+    two = scan_source("try:\n go()\nexcept:\n log()\ntry:\n go()\nexcept:\n"
+                      " log()\n", "b.py")
+    check([r.name for r in sorted([one, two], key=rank)] == ["b.py", "a.py"],
+          "more quiet handlers rank higher among files that are otherwise equal")
+    check([r.name for r in sorted([quiet_plain, broken], key=rank)]
+          == ["zz_broken.py", "plain.py"],
+          "an unreadable file is ranked ahead of every verdict")
 
     # ---- the environment gate: an inherited variable ends the run with 0
     gate = scan_source("import os, sys\nif os.environ.get('RUN_MODE'):\n"
@@ -949,6 +1120,36 @@ def self_test():
     check(scan_source("t = os.environ.get('K')\nf(\n    t=1,\n)\nif t:\n"
                       "    exit(0)\n").verdict == CLEAN,
           "a keyword argument line is read as an assignment  <-- known limit")
+    check(scan_source("if os.environ.get('K'):\n    quit(0)\n").verdict
+          == ENVNOOP, "quit(0) ends the run like exit(0)")
+    check(scan_source("if os.environ.get('K'):\n    work()\n    sys.exit(0)\n"
+                      ).verdict == ENVNOOP,
+          "a block that does real work and then exits 0 is still ENVNOOP  <-- known limit")
+    check(scan_source("if os.environ.get('RUN'):\n    work()\nelse:\n"
+                      "    sys.exit(0)\n").verdict == CLEAN,
+          "an exit 0 in the else of an environment test is not read  <-- known limit")
+    check(scan_source("def main():\n    if os.environ.get('K'):\n"
+                      "        return\n    work()\n").verdict == CLEAN,
+          "a bare return after an environment test is not an exit  <-- known limit")
+    check(scan_source("import os as _os\nif _os.environ.get('K'):\n"
+                      "    exit(0)\n").verdict == CLEAN
+          and scan_source("from os import getenv as ge\nif ge('K'):\n"
+                          "    exit(0)\n").verdict == CLEAN,
+          "an aliased os or getenv is not followed  <-- known limit")
+    check(scan_source("DEV: bool = os.environ.get('K')\nif DEV:\n    exit(0)\n"
+                      ).verdict == CLEAN
+          and scan_source("A, B = os.environ.get('K'), 1\nif A:\n    exit(0)\n"
+                          ).verdict == CLEAN,
+          "an annotated or tuple assignment is not followed  <-- known limit")
+    check(scan_source("def is_dev():\n    return os.environ.get('K')\n"
+                      "if is_dev():\n    exit(0)\n").verdict == CLEAN,
+          "an environment read hidden in a helper function is not followed  <-- known limit")
+    gate = scan_source("env = os.environ\nif env.get('K'):\n    exit(0)\n")
+    check(gate.verdict == ENVNOOP and gate.gate_env == [],
+          "an alias of os.environ is flagged, but the variable name is not recovered")
+    check(scan_source("try:\n    go()\nexcept:\n    if DEBUG:\n        raise\n"
+                      "    log()\n").verdict == CLEAN,
+          "a raise under an if still counts as a re-raise  <-- known limit")
 
     # Gate and handlers together.
     gate = scan_source("import sys\nif os.environ.get('K'):\n    sys.exit(0)\n"
@@ -1006,17 +1207,25 @@ def self_test():
     check(_parse(["a.py", "b.py"]).paths == ["a.py", "b.py"],
           "several paths are read")
 
-    def refused(argv):
-        """True when the parser exits on argv instead of accepting it."""
+    def refusal(argv):
+        """The exit code the parser exits with on argv, or None if it accepts."""
         saved = sys.stderr
         sys.stderr = io.StringIO()
         try:
             _parse(argv)
-        except SystemExit:
-            return True
+        except SystemExit as exc:
+            return exc.code
         finally:
             sys.stderr = saved
-        return False
+        return None
+
+    def refused(argv):
+        return refusal(argv) is not None
+
+    check(refusal(["--bogus"]) == 64 and refusal(["a.py", "--ap"]) == 64,
+          "a bad flag exits 64, not argparse's 2, which means an unreadable file  <-- pinned defect")
+    check(capture(lambda: refusal(["--help"]))[0] == 0,
+          "--help still exits 0")
 
     check(refused(["a.py", "--self"]),
           "a unique prefix of --self-test is refused  <-- pinned defect")
@@ -1052,6 +1261,9 @@ def self_test():
         check("notes.txt" not in output,
               "a .txt file in the tree is not scanned")
         check("scanned=2" in output, "both .py files were scanned")
+        check("jobharness" in output
+              and "explicit command line flag" not in output,
+              "a silent script gets the handler remedy and no gate remedy")
         check("    line 4" not in output, "sites are not printed by default")
         code, output = run([root, "--sites"])
         check("    line 4" in output, "--sites prints the handler line")
@@ -1087,6 +1299,96 @@ def self_test():
             handle.write(b"# \x81\x90\ntry:\n    go()\nexcept:\n    pass\n")
         check(scan_path(undecodable).verdict == SILENT,
               "a byte no codec claims does not stop the scan either")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # ---- file types, the JSON summary, and a tree with nothing to scan
+    root = tempfile.mkdtemp(prefix="alwayszero-kinds-")
+    try:
+        quiet_text = "try:\n    go()\nexcept:\n    log()\n"
+        for name, text in (("task.pyw", quiet_text), ("LOUD.PY", quiet_text),
+                           ("rep.py", quiet_text + "exit(1)\n"),
+                           ("ok.py", "go()\n")):
+            with open(os.path.join(root, name), "w") as handle:
+                handle.write(text)
+        code, output = run([root, "--json"])
+        payload = json.loads(output)
+        check(payload["summary"] == {"silent": 2, "envnoop": 0,
+                                     "unreadable": 0, "reports": 1,
+                                     "clean": 1, "scanned": 4},
+              "--json counts every verdict exactly")
+        names = [os.path.basename(item["file"]) for item in payload["files"]]
+        check("task.pyw" in names, "a .pyw file is scanned")
+        check("LOUD.PY" in names, "an upper-case extension is scanned")
+        check(code == 1, "two silent scripts exit 1")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    root = tempfile.mkdtemp(prefix="alwayszero-empty-")
+    try:
+        code, output = run([root])
+        check(code == 2 and "scanned=0" in output
+              and "nothing was assessed" in output,
+              "an empty directory exits 2 and says nothing was assessed  <-- pinned defect")
+        with open(os.path.join(root, "notes.txt"), "w") as handle:
+            handle.write("except:\n    pass\n")
+        code, output = run([root, "--json"])
+        check(code == 2 and "nothing was assessed" in output,
+              "a directory with no .py or .pyw file also exits 2, with --json too")
+        code, output = run([os.path.join(root, "notes.txt")])
+        check(code == 0 and "CLEAN" in output,
+              "a file named on the command line is scanned whatever its extension")
+
+        # A directory os.walk cannot list is reported to onerror and then
+        # skipped. A real unreadable directory is made by hand on both hosts
+        # (see the README); here the walk is made to fail the same way.
+        real_walk = os.walk
+
+        def flaky_walk(path, onerror=None):
+            for item in real_walk(path, onerror=onerror):
+                yield item
+            onerror(OSError(13, "Permission denied",
+                            os.path.join(path, "locked")))
+
+        os.walk = flaky_walk
+        try:
+            code, output = run([root])
+        finally:
+            os.walk = real_walk
+        check(code == 2 and "UNREADABLE" in output
+              and "locked" in output and "Permission denied" in output,
+              "a directory that cannot be listed is UNREADABLE and exits 2  <-- pinned defect")
+        check("scanned=1" in output and "nothing was assessed" not in output,
+              "the unlistable directory counts as scanned")
+        with open(os.path.join(root, "nightly.py"), "w") as handle:
+            handle.write(quiet_text)
+        os.walk = flaky_walk
+        try:
+            code, output = run([root])
+        finally:
+            os.walk = real_walk
+        check(code == 1 and "UNREADABLE" in output and "SILENT" in output,
+              "a silent script is still named when another directory could not be read")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # A file name the console cannot encode must not crash the report. The
+    # stream here is ASCII, the way cp1252 is for a Greek letter on Windows.
+    root = tempfile.mkdtemp(prefix="alwayszero-name-")
+    try:
+        with open(os.path.join(root, "café.py"), "w") as handle:
+            handle.write("go()\n")
+        raw = io.BytesIO()
+        narrow = io.TextIOWrapper(raw, encoding="ascii")
+        saved = sys.stdout
+        sys.stdout = narrow
+        try:
+            code = main([root])
+            narrow.flush()
+        finally:
+            sys.stdout = saved
+        check(code == 0 and b"caf\\xe9.py" in raw.getvalue(),
+              "a file name the output encoding cannot hold is escaped, not a crash  <-- pinned defect")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1190,8 +1492,16 @@ def self_test():
 
 # --------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a bad flag, and 2 here means a file was unreadable."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="alwayszero.py",
         description="Name every scheduled script that cannot report failure.",
         epilog="Exit 1 means work was found, so this drives a detect-and-"
@@ -1218,9 +1528,15 @@ def main(argv=None):
     if not args.paths:
         print("error: give at least one file or directory. Use --self-test to "
               "verify the tool without a corpus.", file=sys.stderr)
-        return 64
+        return EXIT_USAGE
 
-    reports = sorted((scan_path(path) for path in iter_sources(args.paths)),
+    # A report line holds file names, and a name the console's code page cannot
+    # encode would crash print with exit 1, which reads as "work found".
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
+
+    sources, failures = iter_sources(args.paths)
+    reports = sorted([scan_path(path) for path in sources] + failures,
                      key=rank)
     silent = [r for r in reports if r.verdict == SILENT]
     gated = [r for r in reports if r.verdict == ENVNOOP]
@@ -1251,9 +1567,13 @@ def main(argv=None):
                   "flag, so a scheduler has to type it.")
 
     if silent or gated:
-        return 1
-    if unreadable:
-        return 2
+        return EXIT_FOUND
+    if not reports:
+        # Nothing was examined, which is not the same as nothing being wrong.
+        print("error: no .py or .pyw file was found under the given paths, so "
+              "nothing was assessed.", file=sys.stderr)
+    if unreadable or not reports:
+        return EXIT_UNREAD
     return 0
 
 
