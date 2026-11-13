@@ -118,9 +118,10 @@ _EXCEPT_RE = re.compile(r"^([ \t]*)except\b([^:]*):(.*)$")
 # SystemExit, up to the opening parenthesis. exit_arguments() reads the argument
 # from there, with its parentheses balanced, so exit(0) can be told from
 # exit(main()). The lookbehind keeps the bare-name branch off the tail of
-# sys.exit.
+# sys.exit and off `def exit(self)` and `class SystemExit(`.
 _EXIT_RE = re.compile(
-    r"(?<![\w.])(?:sys\.exit|os\._exit|exit|quit|SystemExit)\s*\(")
+    r"(?<![\w.])(?<!def )(?<!class )"
+    r"(?:sys\.exit|os\._exit|exit|quit|SystemExit)\s*\(")
 
 # A whole statement that is an exit call, with or without raise in front.
 _EXITSTMT_RE = re.compile(
@@ -165,7 +166,7 @@ _ASSIGN_RE = re.compile(r"^[ \t]*([A-Za-z_]\w*)[ \t]*=(?!=)(.*)$")
 # Arguments that mean the process ends successfully anyway. "0L" is a Python 2
 # long literal and turns up in this corpus. A string is not here: sys.exit with
 # a string prints it and exits 1, and the masker keeps a quote mark for it.
-_ZERO_STATUS = ("", "0", "0L", "None", "False")
+_ZERO_STATUS = ("", "0", "0L", "None", "False", "0.0", "0x0", "0o0", "0b0")
 
 # Tokens that make up an f-string from Python 3.12 (PEP 701). Earlier versions
 # lack the names, and there an f-string is one STRING token.
@@ -886,6 +887,14 @@ def self_test():
           "sys.exit(None) ends the process successfully")
     check(exit_status("sys.exit(0L)") == ZERO_EXIT,
           "the python 2 long literal 0L is a zero status")
+    check(exit_status("def exit(self):\n    return 1\n") == NO_EXIT
+          and exit_status("class SystemExit(Exception):\n    pass\n") == NO_EXIT,
+          "defining a function or class named exit is not a process exit  <-- pinned defect")
+    check(exit_status("sys.exit(0x0)") == ZERO_EXIT
+          and exit_status("sys.exit(0.0)") == ZERO_EXIT
+          and exit_status("sys.exit(0o0)") == ZERO_EXIT
+          and exit_status("sys.exit(0b0)") == ZERO_EXIT,
+          "0x0, 0.0, 0o0 and 0b0 are zero statuses  <-- pinned defect")
     check(exit_status("sys.exit(0)\nsys.exit(1)") == NONZERO_EXIT,
           "one non-zero exit outranks any number of zero ones")
     check(exit_status("self.exit(1)") == NO_EXIT,

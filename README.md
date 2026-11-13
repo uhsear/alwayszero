@@ -117,10 +117,10 @@ PASS  a directory the account cannot list is UNREADABLE and exits 2  <-- pinned 
 PASS  a cp1252 comment does not stop the scan  <-- pinned defect
 ...
 --------------------------------------------------------------------
-249 assertions, 0 failed
+251 assertions, 0 failed
 ```
 
-That run is 249 assertions on Windows under `C:\Python313\python.exe` (3.13.2). The same 249 pass on Windows under 3.12.10, 3.11.15, 3.10.20 and 3.9.25, and on Ubuntu under `python3` 3.12.3. The count is equal on every host because no assertion is skipped on any platform. The lines cut with `...` are more of the same block above them: the full run prints one `PASS` line per assertion.
+That run is 251 assertions on Windows under `C:\Python313\python.exe` (3.13.2). The same 251 pass on Windows under 3.12.10, 3.11.15, 3.10.20 and 3.9.25, and on Ubuntu under `python3` 3.12.3. The count is equal on every host because no assertion is skipped on any platform. The lines cut with `...` are more of the same block above them: the full run prints one `PASS` line per assertion.
 
 ## Requirements
 
@@ -378,9 +378,9 @@ one and reports the directory as `UNREADABLE`.
 
 | Check | Result |
 |---|---|
-| `--self-test`, Windows, Python 3.13.2 | 249 assertions, 0 failed |
-| `--self-test`, Windows, Python 3.12.10, 3.11.15, 3.10.20 and 3.9.25 | 249 assertions, 0 failed on each |
-| `--self-test`, Ubuntu, Python 3.12.3 | 249 assertions, 0 failed |
+| `--self-test`, Windows, Python 3.13.2 | 251 assertions, 0 failed |
+| `--self-test`, Windows, Python 3.12.10, 3.11.15, 3.10.20 and 3.9.25 | 251 assertions, 0 failed on each |
+| `--self-test`, Ubuntu, Python 3.12.3 | 251 assertions, 0 failed |
 | `coverage run --branch alwayszero.py --self-test` | 100 percent, 911 statements, 176 branches |
 | `pyflakes alwayszero.py`, `python -W error -m py_compile` | clean |
 | A line-level mutation sweep of the decision core, once | 267 mutants, 45 survivors, none that changes a result |
